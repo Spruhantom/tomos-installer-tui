@@ -44,7 +44,7 @@ The installer also adds a **Tom OS Installer** entry to your app menu (Linux) or
 - **Reads the stick back** and compares it byte for byte with the image.
 - **Type-to-confirm**: you type the drive name (`sdb`, `disk4`, `disk2`) before anything is erased.
 - **Also a CLI** for scripts: `--list`, `--info`, `--download`, `--burn`.
-- Redraws when you resize the terminal window.
+- Fits itself to the size of your terminal window.
 
 ## Screenshots
 

@@ -972,6 +972,7 @@ function Main([string[]]$argv) {
       if (-not (Fetch-Manifest)) { Fail $TS.ManifestError }
       [Console]::Error.WriteLine("    Tom OS $($TS.Version) - $($TS.IsoName) ($(Human $TS.TotalSize))")
       if (-not (Do-Download $true)) { Fail $TS.Message }
+      if ($TS.Message -like 'Already downloaded*') { [Console]::Error.WriteLine("    Already downloaded and verified") }
       [Console]::Error.WriteLine("$GREEN$CB$G_OK$C0 Saved to $($TS.IsoPath)")
     }
     'burn' { Cli-Burn $burn $iso $yes $false }

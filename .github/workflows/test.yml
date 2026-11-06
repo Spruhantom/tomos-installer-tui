@@ -152,7 +152,7 @@ jobs:
           Copy-Item tomos-installer-tui.ps1 srv\
           Start-Process python -ArgumentList '-m', 'http.server', '8765', '--directory', 'srv' -WindowStyle Hidden
           Start-Sleep 3
-          (Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8765/download/parts.sha256).Content
+          curl.exe -fsS http://127.0.0.1:8765/download/parts.sha256
 
       - name: Install with the one-liner script
         run: |
@@ -172,8 +172,9 @@ jobs:
           curl.exe -fsS -r 0-999999 -o C:\dl\.tomos-test-amd64.iso.part1 http://127.0.0.1:8765/download/tomos-test-amd64.iso.part1
           .\tomos-installer-tui.ps1 --download
           if ((Get-FileHash C:\dl\tomos-test-amd64.iso).Hash -ne (Get-FileHash C:\test.iso).Hash) { throw 'download differs' }
-          .\tomos-installer-tui.ps1 --download 2>&1 | Out-String | Tee-Object -Variable second
-          if ($second -notmatch 'Already downloaded') { throw 'second run did not reuse the download' }
+          $before = (Get-Item C:\dl\tomos-test-amd64.iso).LastWriteTimeUtc
+          .\tomos-installer-tui.ps1 --download
+          if ((Get-Item C:\dl\tomos-test-amd64.iso).LastWriteTimeUtc -ne $before) { throw 'second run did not reuse the download' }
 
       - name: Attach a virtual disk
         run: |
