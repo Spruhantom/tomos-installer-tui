@@ -1,0 +1,5 @@
+srv/
+*.iso
+*.img
+*.vhd
+.DS_Store

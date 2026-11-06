@@ -1,0 +1,1108 @@
+#!/usr/bin/env bash
+# Tom OS Installer TUI — download Tom OS and burn it to a USB stick.
+# https://github.com/Spruhantom/tomos-installer-tui   (MIT licence)
+#
+# Works on Linux (Ubuntu, Debian, Fedora, openSUSE, Arch, …) and macOS.
+# Needs: bash 3.2+, curl, dd, sha256sum or shasum, lsblk (Linux) / diskutil (macOS), sudo.
+
+TUI_VERSION="1.0.0"
+OWNER="Spruhantom"
+REPO="tom-os-hyperland1"
+BRANCH="main"
+DEFAULT_TOMOS_VERSION="26.10"
+RAW_BASE="${TOMOS_TUI_BASE_URL:-https://raw.githubusercontent.com/$OWNER/$REPO/$BRANCH}/download"
+LFS_BASE="${TOMOS_TUI_BASE_URL:-https://media.githubusercontent.com/media/$OWNER/$REPO/$BRANCH}/download"
+API_LATEST="https://api.github.com/repos/$OWNER/$REPO/releases/latest"
+BS=4194304   # 4 MiB
+
+OS="$(uname -s)"
+case "$OS" in
+  Linux) PLATFORM=linux ;;
+  Darwin) PLATFORM=mac ;;
+  *) PLATFORM=other ;;
+esac
+
+# The screens use UTF-8 box drawing; make sure bash counts characters, not bytes.
+case "$(locale charmap 2>/dev/null)" in
+  UTF-8|utf8) ;;
+  *) if [ "$OS" = Darwin ]; then export LC_ALL=en_US.UTF-8
+     else
+       _have=$(locale -a 2>/dev/null | tr 'A-Z' 'a-z' | tr -d '-')
+       for _l in C.UTF-8 en_US.UTF-8 en_GB.UTF-8; do
+         case " $(printf '%s' "$_have" | tr '\n' ' ') " in
+           *" $(printf '%s' "$_l" | tr 'A-Z' 'a-z' | tr -d '-') "*) export LC_ALL="$_l"; break ;;
+         esac
+       done
+     fi ;;
+esac
+
+# ------------------------------------------------------------------ state
+ISO_PATH=""; ISO_SIZE=0; ISO_VERIFIED=0; ISO_SHA=""
+DRIVE=""; DRIVE_NAME=""; DRIVE_SIZE=0
+TOMOS_VERSION=""; ISO_NAME=""; TOTAL_SIZE=0; REMOTE_SHA=""
+PART_NAMES=""; PART_SUMS=""; PART_SIZES=""
+SHOW_ALL=0
+VERIFY=1
+MESSAGE=""; MESSAGE_KIND=info
+WORK="${TMPDIR:-/tmp}/tomos-tui.$$"
+SUDO_KEEPALIVE=""
+IN_TUI=0
+if [ "$(id -u)" = 0 ] || [ -n "$TOMOS_TUI_NO_SUDO" ]; then SUDO=""; else SUDO="sudo"; fi
+
+download_dir() {
+  local d=""
+  if [ -n "$TOMOS_TUI_DIR" ]; then d="$TOMOS_TUI_DIR"
+  elif command -v xdg-user-dir >/dev/null 2>&1; then d="$(xdg-user-dir DOWNLOAD 2>/dev/null)/TomOS"
+  fi
+  [ -z "$d" ] || [ "$d" = "/TomOS" ] && d="$HOME/Downloads/TomOS"
+  printf '%s' "$d"
+}
+DL_DIR="$(download_dir)"
+
+# ------------------------------------------------------------------ colours (256-colour palette)
+E=$'\033'
+if [ -t 1 ] && [ "${NO_COLOR:-}" = "" ]; then
+  R="${E}[0m"; B="${E}[1m"; DIM="${E}[2m"
+  PINK="${E}[38;5;198m"; CYAN="${E}[38;5;51m"; PURPLE="${E}[38;5;135m"; MUTED="${E}[38;5;103m"
+  GREEN="${E}[38;5;48m"; RED="${E}[38;5;203m"; YELLOW="${E}[38;5;220m"; WHITE="${E}[38;5;255m"
+  BGSEL="${E}[48;5;53m"; BGBAR="${E}[48;5;236m"
+else
+  R=""; B=""; DIM=""; PINK=""; CYAN=""; PURPLE=""; MUTED=""; GREEN=""; RED=""; YELLOW=""; WHITE=""; BGSEL=""; BGBAR=""
+fi
+GRAD="198 199 200 164 165 129 135 99 63 69 75 45 51"
+
+# ------------------------------------------------------------------ small helpers
+have() { command -v "$1" >/dev/null 2>&1; }
+now() { date +%s; }
+
+fsize() {  # size of a file in bytes
+  stat -c %s "$1" 2>/dev/null || stat -f %z "$1" 2>/dev/null || wc -c <"$1" | tr -d ' '
+}
+
+sha256() {  # sha256 of stdin
+  if have sha256sum; then sha256sum | cut -d' ' -f1
+  else shasum -a 256 | cut -d' ' -f1
+  fi
+}
+
+human() {  # bytes -> "2.8 GB" (decimal units, like drive makers)
+  awk -v n="${1:-0}" 'BEGIN{ split("B KB MB GB TB",u," "); i=1; while (n>=1000 && i<5){n/=1000;i++}
+    if(i==1) printf "%d B", n; else printf "%.1f %s", n, u[i] }'
+}
+
+eta() {  # seconds -> "4m 05s"
+  local s=${1:-0}
+  if [ "$s" -le 0 ] 2>/dev/null; then printf -- '—'; return; fi
+  if [ "$s" -ge 3600 ]; then printf '%dh %02dm' $((s/3600)) $(((s%3600)/60))
+  elif [ "$s" -ge 60 ]; then printf '%dm %02ds' $((s/60)) $((s%60))
+  else printf '%ds' "$s"; fi
+}
+
+repeat() { local i=0 out=""; while [ $i -lt "$2" ]; do out="$out$1"; i=$((i+1)); done; printf '%s' "$out"; }
+
+cols() { local c; c=$(tput cols 2>/dev/null || echo 80); [ "$c" -gt 0 ] 2>/dev/null || c=80; echo "$c"; }
+lines() { local l; l=$(tput lines 2>/dev/null || echo 24); [ "$l" -gt 0 ] 2>/dev/null || l=24; echo "$l"; }
+
+die() { leave_tui; printf '%serror:%s %s\n' "$RED$B" "$R" "$*" >&2; exit 1; }
+
+# ------------------------------------------------------------------ terminal
+enter_tui() {
+  [ -t 0 ] && [ -t 1 ] || return
+  IN_TUI=1
+  printf '%s[?1049h%s[?25l' "$E" "$E"
+  stty -echo 2>/dev/null
+}
+leave_tui() {
+  [ "$IN_TUI" = 1 ] || return
+  IN_TUI=0
+  stty echo 2>/dev/null
+  printf '%s[?25h%s[0m%s[?1049l' "$E" "$E" "$E"
+}
+cleanup() {
+  leave_tui
+  [ -n "$SUDO_KEEPALIVE" ] && kill "$SUDO_KEEPALIVE" 2>/dev/null
+  [ -n "$BG_PID" ] && kill "$BG_PID" 2>/dev/null
+  rm -rf "$WORK"
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+mkdir -p "$WORK"
+
+clear_screen() { printf '%s[H%s[2J' "$E" "$E"; }
+at() { printf '%s[%d;%dH' "$E" "$1" "$2"; }
+
+# read one key: sets KEY to up/down/left/right/enter/esc/space/backspace or the character
+read_key() {
+  local k rest t="${1:-}"
+  KEY=""
+  if [ -n "$t" ]; then IFS= read -rsn1 -t "$t" k || { KEY=timeout; return; }
+  else IFS= read -rsn1 k || { KEY=eof; return; }
+  fi
+  case "$k" in
+    $'\033')
+      IFS= read -rsn2 -t 1 rest 2>/dev/null || rest=""
+      case "$rest" in
+        '[A'|'OA') KEY=up ;; '[B'|'OB') KEY=down ;; '[C'|'OC') KEY=right ;; '[D'|'OD') KEY=left ;;
+        '') KEY=esc ;; *) KEY=esc ;;
+      esac ;;
+    '') KEY=enter ;;
+    ' ') KEY=space ;;
+    $'\177'|$'\010') KEY=backspace ;;
+    *) KEY="$k" ;;
+  esac
+}
+
+# ------------------------------------------------------------------ drawing
+W=78; X=1
+layout() {
+  local c; c=$(cols)
+  W=78; [ "$c" -lt 80 ] && W=$((c-2))
+  X=$(( (c - W) / 2 + 1 )); [ $X -lt 1 ] && X=1
+}
+
+logo() {  # big gradient "TOM OS"
+  local row=$1 i=0 line col
+  local L1=' ████████╗ ██████╗ ███╗   ███╗     ██████╗ ███████╗'
+  local L2=' ╚══██╔══╝██╔═══██╗████╗ ████║    ██╔═══██╗██╔════╝'
+  local L3='    ██║   ██║   ██║██╔████╔██║    ██║   ██║███████╗'
+  local L4='    ██║   ██║   ██║██║╚██╔╝██║    ██║   ██║╚════██║'
+  local L5='    ██║   ╚██████╔╝██║ ╚═╝ ██║    ╚██████╔╝███████║'
+  local L6='    ╚═╝    ╚═════╝ ╚═╝     ╚═╝     ╚═════╝ ╚══════╝'
+  local off=$(( X + (W - 52) / 2 ))
+  for line in "$L1" "$L2" "$L3" "$L4" "$L5" "$L6"; do
+    set -- $GRAD
+    shift $(( i * 2 > 10 ? 10 : i * 2 ))
+    col=$1
+    at $((row + i)) "$off"; printf '%s[38;5;%sm%s%s' "$E" "$col" "$line" "$R"
+    i=$((i+1))
+  done
+  local sub="//  L I V E   U S B   I N S T A L L E R  //"
+  at $((row + 6)) $(( X + (W - ${#sub}) / 2 )); printf '%s%s%s%s' "$CYAN" "$B" "$sub" "$R"
+}
+
+hline() { printf '%s' "$(repeat "$1" "$2")"; }
+
+box() {  # box ROW HEIGHT COLOR TITLE
+  local r=$1 h=$2 c=$3 title="$4" i
+  at "$r" "$X"; printf '%s╭─%s' "$c" "$R"
+  if [ -n "$title" ]; then printf '%s%s %s %s' "$B" "$c" "$title" "$R"; printf '%s%s╮%s' "$c" "$(hline ─ $((W - ${#title} - 5)))" "$R"
+  else printf '%s%s╮%s' "$c" "$(hline ─ $((W - 3)))" "$R"; fi
+  i=1
+  while [ $i -lt $((h - 1)) ]; do
+    at $((r + i)) "$X"; printf '%s│%s%*s%s│%s' "$c" "$R" $((W - 2)) "" "$c" "$R"
+    i=$((i+1))
+  done
+  at $((r + h - 1)) "$X"; printf '%s╰%s╯%s' "$c" "$(hline ─ $((W - 2)))" "$R"
+}
+
+text_at() { at "$1" $((X + $2)); printf '%s' "$3"; }
+
+footer() {
+  local l; l=$(lines)
+  at "$l" "$X"; printf '%s%s%s' "$MUTED" "$1" "$R"
+  local v="v$TUI_VERSION"
+  [ $(( ${#1} + ${#v} + 2 )) -le "$W" ] || return 0
+  at "$l" $((X + W - ${#v})); printf '%s%s%s' "$PURPLE" "$v" "$R"
+}
+
+bar() {  # bar WIDTH DONE TOTAL  -> gradient progress bar
+  local w=$1 done=$2 total=$3 filled i c
+  [ "$total" -gt 0 ] 2>/dev/null || total=1
+  filled=$(awk -v d="$done" -v t="$total" -v w="$w" 'BEGIN{f=int(d*w/t); if(f>w)f=w; if(f<0)f=0; print f}')
+  set -- $GRAD
+  local n=$#
+  i=0
+  local out=""
+  while [ $i -lt "$filled" ]; do
+    c=$(( i * n / w + 1 ))
+    eval "col=\${$c}"
+    out="$out${E}[38;5;${col}m█"
+    i=$((i+1))
+  done
+  out="$out${E}[38;5;237m$(repeat ░ $((w - filled)))$R"
+  printf '%s' "$out"
+}
+
+status_card() {  # summary of what is chosen
+  local r=$1
+  box "$r" 5 "$PURPLE" "STATUS"
+  if [ -n "$ISO_PATH" ]; then
+    local tag="${YELLOW}local file$R"; [ "$ISO_VERIFIED" = 1 ] && tag="${GREEN}✔ SHA-256 verified$R"
+    text_at $((r+1)) 3 "${MUTED}IMAGE ${R} ${WHITE}$(basename "$ISO_PATH")${R}  ${MUTED}$(human "$ISO_SIZE")${R}  $tag"
+  else
+    text_at $((r+1)) 3 "${MUTED}IMAGE ${R} ${DIM}not chosen yet${R}"
+  fi
+  if [ -n "$DRIVE" ]; then
+    text_at $((r+2)) 3 "${MUTED}DRIVE ${R} ${WHITE}${DRIVE_NAME}${R}  ${MUTED}$(human "$DRIVE_SIZE") · $DRIVE${R}"
+  else
+    text_at $((r+2)) 3 "${MUTED}DRIVE ${R} ${DIM}not chosen yet${R}"
+  fi
+  local v="on"; [ "$VERIFY" = 1 ] || v="off"
+  local rel="checking GitHub…"; [ -n "$TOMOS_VERSION" ] && rel="Tom OS $TOMOS_VERSION · $(human "$TOTAL_SIZE")"
+  [ -f "$WORK/manifest.err" ] && rel="${YELLOW}offline${R}"
+  text_at $((r+3)) 3 "${MUTED}LATEST${R} ${CYAN}$rel${R}   ${MUTED}VERIFY${R} $v"
+}
+
+message_line() {
+  local r=$1
+  [ -n "$MESSAGE" ] || return
+  local c="$CYAN"; case "$MESSAGE_KIND" in err) c="$RED" ;; ok) c="$GREEN" ;; warn) c="$YELLOW" ;; esac
+  local m="$MESSAGE"; [ ${#m} -gt $((W - 4)) ] && m="${m:0:$((W - 5))}…"
+  text_at "$r" 1 "$c● $m$R"
+}
+
+# ------------------------------------------------------------------ release manifest
+fetch_manifest() {  # fills TOMOS_VERSION, ISO_NAME, REMOTE_SHA, PART_* and TOTAL_SIZE
+  local tag sums p size
+  rm -f "$WORK/manifest.err"
+  TOMOS_VERSION="${TOMOS_TUI_VERSION:-}"
+  if [ -z "$TOMOS_VERSION" ]; then
+    tag=$(curl -fsSL --max-time 15 -H 'Accept: application/vnd.github+json' "$API_LATEST" 2>/dev/null |
+          sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)
+    TOMOS_VERSION="${tag#v}"; TOMOS_VERSION="${TOMOS_VERSION#V}"
+    [ -n "$TOMOS_VERSION" ] || TOMOS_VERSION="$DEFAULT_TOMOS_VERSION"
+  fi
+  ISO_NAME="tomos-$TOMOS_VERSION-amd64.iso"
+  REMOTE_SHA=$(curl -fsSL --max-time 20 "$RAW_BASE/$ISO_NAME.sha256" 2>/dev/null | awk -v n="$ISO_NAME" '$2==n||$2=="*"n{print tolower($1)}' | head -n1)
+  sums=$(curl -fsSL --max-time 20 "$RAW_BASE/parts.sha256" 2>/dev/null | awk -v n="$ISO_NAME.part" 'index($2,n)==1{print tolower($1)" "$2}')
+  if [ -z "$REMOTE_SHA" ] || [ -z "$sums" ]; then
+    echo "could not read the checksums from github.com/$OWNER/$REPO" >"$WORK/manifest.err"
+    TOMOS_VERSION=""; return 1
+  fi
+  # sort parts numerically by their suffix (portable, no sort -V needed)
+  sums=$(printf '%s\n' "$sums" | awk '{n=$2; sub(/.*part/,"",n); print n" "$0}' | sort -n | cut -d' ' -f2-)
+  PART_NAMES=""; PART_SUMS=""; PART_SIZES=""; TOTAL_SIZE=0
+  while read -r h p; do
+    [ -n "$p" ] || continue
+    size=$(curl -fsIL --max-time 20 "$LFS_BASE/$p" 2>/dev/null | tr -d '\r' | awk 'tolower($1)=="content-length:"{s=$2} END{print s+0}')
+    PART_NAMES="$PART_NAMES $p"; PART_SUMS="$PART_SUMS $h"; PART_SIZES="$PART_SIZES $size"
+    TOTAL_SIZE=$((TOTAL_SIZE + size))
+  done <<EOF
+$sums
+EOF
+  printf '%s\n' "$TOMOS_VERSION|$ISO_NAME|$REMOTE_SHA|$TOTAL_SIZE|$PART_NAMES|$PART_SUMS|$PART_SIZES" >"$WORK/manifest"
+  return 0
+}
+
+load_manifest() {  # from a background fetch
+  [ -z "$TOMOS_VERSION" ] && [ -f "$WORK/manifest" ] || return
+  IFS='|' read -r TOMOS_VERSION ISO_NAME REMOTE_SHA TOTAL_SIZE PART_NAMES PART_SUMS PART_SIZES <"$WORK/manifest"
+  # reuse a verified download
+  if [ -z "$ISO_PATH" ] && is_verified "$DL_DIR/$ISO_NAME"; then
+    ISO_PATH="$DL_DIR/$ISO_NAME"; ISO_SIZE=$(fsize "$ISO_PATH"); ISO_VERIFIED=1; ISO_SHA="$REMOTE_SHA"
+  fi
+}
+
+is_verified() {  # file has a matching .verified marker
+  [ -f "$1" ] && [ -f "$1.verified" ] && [ -n "$REMOTE_SHA" ] &&
+    [ "$(cat "$1.verified")" = "$REMOTE_SHA $(fsize "$1")" ]
+}
+
+nth() { local i=$1; shift; eval "printf '%s' \"\${$i}\""; }
+
+# ------------------------------------------------------------------ progress screen
+# progress_screen TITLE SUBTITLE DONE TOTAL STARTED [STEPS...]
+progress_screen() {
+  local title="$1" sub="$2" done=$3 total=$4 started=$5; shift 5
+  layout; clear_screen; logo 2
+  local r=11
+  box $r $(( $# > 3 ? $# + 7 : 10 )) "$CYAN" "$title"
+  text_at $((r+1)) 3 "${MUTED}$sub${R}"
+  local pct=0; [ "$total" -gt 0 ] 2>/dev/null && pct=$(awk -v d="$done" -v t="$total" 'BEGIN{printf "%.1f", d*100/t}')
+  at $((r+3)) $((X + 3)); bar $((W - 16)) "$done" "$total"; printf '  %s%s%5s%%%s' "$WHITE" "$B" "$pct" "$R"
+  local el=$(( $(now) - started )); [ $el -lt 1 ] && el=1
+  local speed=$(( done / el )); local left=0
+  [ $speed -gt 0 ] && left=$(( (total - done) / speed ))
+  text_at $((r+4)) 3 "${WHITE}$(human "$done")${R} ${MUTED}of $(human "$total")   ·   $(human $speed)/s   ·   $(eta $left) left${R}"
+  local i=6 s
+  for s in "$@"; do text_at $((r+i)) 3 "$s"; i=$((i+1)); done
+  footer "Ctrl+C cancels"
+}
+
+step() {  # step STATE TEXT  -> "✔ text" / "▸ text" / "· text"
+  case "$1" in
+    done) printf '%s✔%s %s' "$GREEN" "$R" "$2" ;;
+    now) printf '%s▸%s %s%s%s' "$PINK" "$R" "$WHITE$B" "$2" "$R" ;;
+    *) printf '%s·%s %s%s%s' "$MUTED" "$R" "$MUTED" "$2" "$R" ;;
+  esac
+}
+
+# Runs a command string in the background with stderr going to $WORK/dd.log, and
+# draws progress from dd's output until it finishes. Returns the command's exit code.
+#   STEPS=(line line ...); run_dd TITLE SUB TOTAL CMD
+DDLOG=""
+STEPS=()
+run_dd() {
+  local title="$1" sub="$2" total=$3 cmd="$4" started; started=$(now)
+  DDLOG="$WORK/dd.log"; : >"$DDLOG"
+  bash -c "$cmd" 2>"$DDLOG" &
+  BG_PID=$!
+  local done=0 tick=0
+  while kill -0 "$BG_PID" 2>/dev/null; do
+    if [ "$PLATFORM" = mac ]; then $SUDO pkill -INFO -x dd 2>/dev/null; fi
+    done=$(tr '\r' '\n' <"$DDLOG" 2>/dev/null | sed -n 's/^\([0-9][0-9]*\) bytes.*/\1/p' | tail -n1)
+    [ -n "$done" ] || done=0
+    [ "$done" -gt "$total" ] 2>/dev/null && done=$total
+    if [ "$IN_TUI" = 1 ]; then
+      progress_screen "$title" "$sub" "$done" "$total" "$started" ${STEPS[@]+"${STEPS[@]}"}
+    else
+      printf '\r  %s%s %s / %s   ' "$(bar 30 "$done" "$total")" "$R" "$(human "$done")" "$(human "$total")" >&2
+    fi
+    sleep 1
+    tick=$((tick+1))
+  done
+  wait "$BG_PID"; local rc=$?
+  BG_PID=""
+  if [ "$IN_TUI" != 1 ]; then
+    [ $rc -eq 0 ] && printf '\r  %s%s %s / %s   ' "$(bar 30 "$total" "$total")" "$R" "$(human "$total")" "$(human "$total")" >&2
+    printf '\n' >&2
+  fi
+  return $rc
+}
+
+# ------------------------------------------------------------------ download
+do_download() {
+  [ -n "$TOMOS_VERSION" ] || fetch_manifest || { MESSAGE="Can't reach GitHub: $(cat "$WORK/manifest.err" 2>/dev/null)"; MESSAGE_KIND=err; return 1; }
+  mkdir -p "$DL_DIR" || { MESSAGE="Can't create $DL_DIR"; MESSAGE_KIND=err; return 1; }
+  local iso="$DL_DIR/$ISO_NAME" tmp="$DL_DIR/$ISO_NAME.download"
+  if is_verified "$iso"; then
+    ISO_PATH="$iso"; ISO_SIZE=$(fsize "$iso"); ISO_VERIFIED=1; ISO_SHA="$REMOTE_SHA"
+    MESSAGE="Already downloaded and verified: $iso"; MESSAGE_KIND=ok; return 0
+  fi
+  # free space check
+  local free
+  free=$(df -Pk "$DL_DIR" 2>/dev/null | awk 'NR==2{print $4*1024}')
+  if [ -n "$free" ] && [ "$free" -lt $((TOTAL_SIZE + 1100000000)) ] 2>/dev/null; then
+    MESSAGE="Not enough free space in $DL_DIR: need $(human $((TOTAL_SIZE + 1100000000))), have $(human "$free")"; MESSAGE_KIND=err; return 1
+  fi
+  set -- $PART_NAMES; local nparts=$#
+  local started; started=$(now)
+  local i=1 offset=0 have
+  have=0; [ -f "$tmp" ] && have=$(fsize "$tmp")
+  while [ $i -le $nparts ]; do
+    local p h s
+    p=$(nth $i $PART_NAMES); h=$(nth $i $PART_SUMS); s=$(nth $i $PART_SIZES)
+    if [ "$have" -ge $((offset + s)) ] 2>/dev/null && [ "$s" -gt 0 ]; then  # already appended earlier
+      offset=$((offset + s)); i=$((i+1)); continue
+    fi
+    # anything after a complete part boundary is stale
+    if [ "$have" -gt "$offset" ]; then
+      truncate_file "$tmp" "$offset" || { MESSAGE="Can't resume the partial download, delete $tmp"; MESSAGE_KIND=err; return 1; }
+    fi
+    local partfile="$DL_DIR/.$p"
+    curl -fL --retry 5 --retry-delay 3 --connect-timeout 20 -C - -s -o "$partfile" "$LFS_BASE/$p" 2>"$WORK/curl.err" &
+    BG_PID=$!
+    while kill -0 "$BG_PID" 2>/dev/null; do
+      local got=0; [ -f "$partfile" ] && got=$(fsize "$partfile")
+      local j=1; STEPS=()
+      while [ $j -le $nparts ]; do
+        local st=todo; [ $j -lt $i ] && st=done; [ $j -eq $i ] && st=now
+        STEPS[$((j-1))]="$(step $st "Part $j of $nparts  $(nth $j $PART_NAMES)")"
+        j=$((j+1))
+      done
+      progress_screen "DOWNLOADING TOM OS $TOMOS_VERSION" "from github.com/$OWNER/$REPO  →  $DL_DIR" $((offset + got)) "$TOTAL_SIZE" "$started" "${STEPS[@]}"
+      read_key 1
+      case "$KEY" in q|Q|esc) kill "$BG_PID" 2>/dev/null; wait "$BG_PID" 2>/dev/null; BG_PID=""; MESSAGE="Download paused — choose Download again to resume"; MESSAGE_KIND=warn; return 1 ;; esac
+    done
+    wait "$BG_PID"; local rc=$?; BG_PID=""
+    if [ $rc -ne 0 ]; then
+      MESSAGE="Download failed (curl $rc). Check your connection and choose Download to resume."; MESSAGE_KIND=err; return 1
+    fi
+    progress_screen "DOWNLOADING TOM OS $TOMOS_VERSION" "Checking part $i of $nparts…" $((offset + s)) "$TOTAL_SIZE" "$started"
+    local got_sha; got_sha=$(sha256 <"$partfile")
+    if [ "$got_sha" != "$h" ]; then
+      rm -f "$partfile"
+      MESSAGE="Part $i failed its SHA-256 check and was deleted — choose Download to try again"; MESSAGE_KIND=err; return 1
+    fi
+    cat "$partfile" >>"$tmp" && rm -f "$partfile" || { MESSAGE="Writing $tmp failed (disk full?)"; MESSAGE_KIND=err; return 1; }
+    offset=$((offset + s)); have=$offset; i=$((i+1))
+  done
+  # verify the whole image
+  STEPS=("$(step done 'Downloaded every part')" "$(step now 'Checking the whole image')")
+  run_dd "VERIFYING THE DOWNLOAD" "SHA-256 of $ISO_NAME" "$TOTAL_SIZE" \
+    "dd if='$tmp' bs=$BS $(dd_status) | $(sha_cmd) > '$WORK/sum'"
+  local whole; whole=$(cut -d' ' -f1 <"$WORK/sum")
+  if [ "$whole" != "$REMOTE_SHA" ]; then
+    MESSAGE="The joined image does not match the published SHA-256. Delete $tmp and download again."; MESSAGE_KIND=err; return 1
+  fi
+  mv -f "$tmp" "$iso" && printf '%s %s\n' "$REMOTE_SHA" "$(fsize "$iso")" >"$iso.verified"
+  ISO_PATH="$iso"; ISO_SIZE=$(fsize "$iso"); ISO_VERIFIED=1; ISO_SHA="$REMOTE_SHA"
+  MESSAGE="Downloaded and verified Tom OS $TOMOS_VERSION → $iso"; MESSAGE_KIND=ok
+  return 0
+}
+
+sha_cmd() { if have sha256sum; then echo sha256sum; else echo "shasum -a 256"; fi; }
+
+truncate_file() {
+  if have truncate; then truncate -s "$2" "$1"
+  else dd if=/dev/null of="$1" bs=1 seek="$2" 2>/dev/null
+  fi
+}
+
+# iflag=direct reads the stick itself, not the page cache. Some devices (loop
+# devices, a few card readers) refuse direct I/O, so probe first.
+read_flag() {
+  [ "$PLATFORM" = linux ] && [ -z "$TOMOS_TUI_FAKE_DRIVES" ] || return 0
+  if $SUDO dd if="$1" of=/dev/null bs=$BS count=1 iflag=direct status=none 2>/dev/null; then echo "iflag=direct"
+  else $SUDO blockdev --flushbufs "$1" 2>/dev/null; sync; echo ""; fi
+}
+
+# conv=sync pads the last block with zeros so raw devices only get whole sectors
+# (macOS /dev/rdisk and O_DIRECT reject partial ones). BSD dd has no fsync.
+write_flags() {
+  if [ -n "$TOMOS_TUI_FAKE_DRIVES" ]; then
+    if [ "$PLATFORM" = linux ]; then echo "conv=notrunc,fsync"; else echo "conv=notrunc"; fi
+  elif [ "$PLATFORM" = linux ]; then echo "conv=sync,fsync"
+  else echo "conv=sync"; fi
+}
+
+# macOS dd has no status=progress; we poke it with SIGINFO instead (see run_dd)
+dd_status() { if [ "$PLATFORM" = linux ]; then echo "status=progress"; fi; }
+
+# ------------------------------------------------------------------ drives
+# Each drive is one line: dev|size|name|removable|system|ro|mounts
+list_drives() {
+  list_drives_detected
+  # TOMOS_TUI_ALLOW_DEVICE=/dev/xyz lets you pick a device that is not detected as
+  # a USB stick (a loop device, a disk image attached with hdiutil, a card reader…)
+  local d
+  for d in $TOMOS_TUI_ALLOW_DEVICE; do
+    list_drives_detected | awk -F'|' -v d="$d" '$1==d{f=1} END{exit !f}' && continue
+    [ -e "$d" ] || continue
+    local size=0
+    if [ "$PLATFORM" = linux ]; then size=$(lsblk -bdno SIZE "$d" 2>/dev/null | head -n1)
+    else size=$(diskutil info "$d" 2>/dev/null | sed -n 's/.*Disk Size:.*(\([0-9]*\) Bytes).*/\1/p' | head -n1); fi
+    printf '%s|%s|%s|1|0|0|\n' "$d" "${size:-0}" "Allowed device ${d##*/}"
+  done
+}
+
+list_drives_detected() {
+  if [ -n "$TOMOS_TUI_FAKE_DRIVES" ]; then
+    printf '%s\n' "$TOMOS_TUI_FAKE_DRIVES" | tr ';' '\n'
+    return
+  fi
+  if [ "$PLATFORM" = linux ]; then
+    lsblk -dnbP -o NAME,SIZE,RM,HOTPLUG,TRAN,TYPE,RO,VENDOR,MODEL 2>/dev/null |
+    while IFS= read -r line; do
+      local name size rm hp tran type ro vendor model
+      name=$(kv NAME "$line"); size=$(kv SIZE "$line"); rm=$(kv RM "$line"); hp=$(kv HOTPLUG "$line")
+      tran=$(kv TRAN "$line"); type=$(kv TYPE "$line"); ro=$(kv RO "$line"); vendor=$(kv VENDOR "$line"); model=$(kv MODEL "$line")
+      [ "$type" = disk ] || continue
+      case "$name" in loop*|zram*|ram*|sr*) continue ;; esac
+      local removable=0
+      [ "$rm" = 1 ] || [ "$hp" = 1 ] || [ "$tran" = usb ] || [ "$tran" = mmc ] && removable=1
+      case "$name" in mmcblk*) removable=1 ;; esac
+      local mounts system=0
+      mounts=$(lsblk -nro MOUNTPOINT "/dev/$name" 2>/dev/null | sed '/^$/d' | tr '\n' ' ')
+      for m in $mounts; do
+        case "$m" in /|/boot|/boot/efi|/efi|/usr|/var|/home|'[SWAP]'|/run/live*|/cdrom|/run/archiso*|/run/initramfs*) system=1 ;; esac
+      done
+      local label; label=$(printf '%s %s' "$vendor" "$model" | sed 's/\\x20/ /g; s/  */ /g; s/^ //; s/ $//')
+      [ -n "$label" ] || label="$name"
+      printf '/dev/%s|%s|%s|%s|%s|%s|%s\n' "$name" "${size:-0}" "$label" "$removable" "$system" "${ro:-0}" "$mounts"
+    done
+  elif [ "$PLATFORM" = mac ]; then
+    local root stores; root=$(diskutil info / 2>/dev/null | awk -F: '/Part of Whole/{gsub(/ /,"",$2); print $2}')
+    # APFS: / lives on a synthesized disk; the real disk is its "physical store"
+    stores=$(diskutil info "$root" 2>/dev/null | awk -F: '/Physical Store/{gsub(/ /,"",$2); print $2}' | sed 's/s[0-9]*$//')
+    local which="external physical"; [ "$SHOW_ALL" = 1 ] && which="physical"
+    diskutil list $which 2>/dev/null | awk '/^\/dev\/disk[0-9]+/{print $1}' | while read -r dev; do
+      local info size name internal removable=0 system=0 ro=0
+      info=$(diskutil info "$dev" 2>/dev/null)
+      size=$(printf '%s\n' "$info" | sed -n 's/.*Disk Size:.*(\([0-9]*\) Bytes).*/\1/p' | head -n1)
+      name=$(printf '%s\n' "$info" | sed -n 's/^ *Device \/ Media Name: *//p' | head -n1)
+      internal=$(printf '%s\n' "$info" | sed -n 's/^ *Device Location: *//p' | head -n1)
+      [ "$internal" = External ] && removable=1
+      printf '%s\n' "$info" | grep -qE 'Removable Media: +(Removable|Yes)' && removable=1
+      printf '%s\n' "$info" | grep -qE 'Protocol: +(USB|Secure Digital)' && removable=1
+      printf '%s\n' "$info" | grep -qE 'Read-Only Media: +Yes' && ro=1
+      [ "${dev#/dev/}" = "$root" ] && system=1
+      for st in $stores; do [ "${dev#/dev/}" = "$st" ] && system=1; done
+      printf '%s|%s|%s|%s|%s|%s|%s\n' "$dev" "${size:-0}" "${name:-$dev}" "$removable" "$system" "$ro" ""
+    done
+  fi
+}
+
+kv() {  # value of KEY="..." in an lsblk -P line
+  local re="(^| )$1=\"([^\"]*)\""
+  if [[ $2 =~ $re ]]; then printf '%s' "${BASH_REMATCH[2]}"; fi
+}
+
+usable() { # line -> exit 0 if it can be chosen
+  local IFS='|'; set -- $1
+  [ "$4" = 1 ] && [ "$5" != 1 ] && [ "$6" != 1 ] && [ "${2:-0}" -gt 0 ] 2>/dev/null
+}
+
+# ------------------------------------------------------------------ screens
+menu_screen() {
+  local sel=0 n
+  local items
+  while true; do
+    load_manifest
+    local dl_label="Download Tom OS"
+    [ -n "$TOMOS_VERSION" ] && dl_label="Download Tom OS $TOMOS_VERSION  ${MUTED}($(human "$TOTAL_SIZE"), verified)${R}"
+    [ -n "$ISO_PATH" ] && [ "$ISO_VERIFIED" = 1 ] && [ "$(basename "$ISO_PATH")" = "$ISO_NAME" ] && dl_label="Download Tom OS $TOMOS_VERSION  ${GREEN}✔ done${R}"
+    local burn_label="Burn Tom OS to the USB drive"
+    if [ -z "$ISO_PATH" ] || [ -z "$DRIVE" ]; then burn_label="${MUTED}Burn Tom OS to the USB drive  (choose an image and a drive first)${R}"; fi
+    local verify_label="Verify after burning: ${GREEN}on${R}"; [ "$VERIFY" = 1 ] || verify_label="Verify after burning: ${YELLOW}off${R}"
+    set -- "$dl_label" "Use an ISO file already on this computer" "Choose the USB drive" "$burn_label" "$verify_label" "Help" "Quit"
+    n=$#
+    layout; clear_screen; logo 2
+    status_card 10
+    local r=16 i=0 item
+    box $r $((n + 2)) "$PINK" "MENU"
+    for item in "$@"; do
+      if [ $i -eq $sel ]; then
+        at $((r + 1 + i)) $((X + 2)); printf '%s%s %s▸%s %s %s%*s' "$BGSEL" "$PINK$B" "" "$R$BGSEL" "$WHITE$B$item" "$R$BGSEL" 0 ""; printf '%s' "$R"
+      else
+        text_at $((r + 1 + i)) 3 "   $item"
+      fi
+      i=$((i+1))
+    done
+    message_line $((r + n + 3))
+    footer "↑/↓ move   Enter select   d download   f file   u drive   b burn   q quit"
+    read_key 2
+    case "$KEY" in
+      up|k) sel=$(( (sel + n - 1) % n )) ;;
+      down|j) sel=$(( (sel + 1) % n )) ;;
+      d) sel=0; KEY=enter ;;
+      f) sel=1; KEY=enter ;;
+      u) sel=2; KEY=enter ;;
+      b) sel=3; KEY=enter ;;
+      q|Q) return 0 ;;
+      timeout) continue ;;
+    esac
+    if [ "$KEY" = enter ]; then
+      MESSAGE=""
+      case $sel in
+        0) do_download ;;
+        1) file_screen ;;
+        2) drive_screen ;;
+        3) if [ -z "$ISO_PATH" ]; then MESSAGE="Choose an image first (Download, or use an ISO file)"; MESSAGE_KIND=warn
+           elif [ -z "$DRIVE" ]; then MESSAGE="Choose the USB drive first"; MESSAGE_KIND=warn
+           else confirm_screen && burn; fi ;;
+        4) if [ "$VERIFY" = 1 ]; then VERIFY=0; else VERIFY=1; fi ;;
+        5) help_screen ;;
+        6) return 0 ;;
+      esac
+    fi
+  done
+}
+
+file_screen() {
+  local found="" f
+  for d in "$DL_DIR" "$HOME/Downloads" "$HOME/Desktop" "$PWD"; do
+    [ -d "$d" ] || continue
+    for f in "$d"/*.iso "$d"/*.ISO; do
+      [ -f "$f" ] || continue
+      case "|$found|" in *"|$f|"*) ;; *) found="$found|$f" ;; esac
+    done
+  done
+  found="${found#|}"
+  local sel=0 n=0 typed="" mode=list
+  local IFS_OLD="$IFS"
+  while true; do
+    IFS='|'; set -- $found; IFS="$IFS_OLD"
+    n=$#
+    layout; clear_screen; logo 2
+    local r=10
+    box $r $(( (n > 0 ? n : 1) + 6 )) "$PINK" "USE AN ISO FILE"
+    text_at $((r+1)) 3 "${MUTED}ISO files found in Downloads, Desktop and here:${R}"
+    if [ $n -eq 0 ]; then text_at $((r+3)) 3 "${DIM}none found${R}"; fi
+    local i=0 x
+    for x in "$@"; do
+      local s; s=$(human "$(fsize "$x")")
+      local line="$x  ${MUTED}$s${R}"
+      [ ${#x} -gt $((W - 20)) ] && line="…${x: -$((W - 22))}  ${MUTED}$s${R}"
+      if [ "$mode" = list ] && [ $i -eq $sel ]; then text_at $((r + 3 + i)) 2 "${BGSEL}${PINK}${B} ▸ ${R}${BGSEL}${WHITE}${line}${R}"
+      else text_at $((r + 3 + i)) 2 "   $line"; fi
+      i=$((i+1))
+    done
+    local pr=$((r + 3 + (n > 0 ? n : 1) + 1))
+    if [ "$mode" = type ]; then text_at $pr 3 "${CYAN}Path:${R} ${WHITE}${typed}${PINK}▏${R}"
+    else text_at $pr 3 "${MUTED}Press${R} ${CYAN}t${R} ${MUTED}to type a path${R}"; fi
+    footer "↑/↓ move   Enter choose   t type a path   Esc back"
+    read_key
+    if [ "$mode" = type ]; then
+      case "$KEY" in
+        enter) mode=list; local p="${typed/#\~/$HOME}"; if [ -f "$p" ]; then choose_iso "$p"; return; else MESSAGE="No such file: $p"; MESSAGE_KIND=err; return; fi ;;
+        esc) mode=list ;;
+        backspace) typed="${typed%?}" ;;
+        space) typed="$typed " ;;
+        up|down|left|right|timeout) ;;
+        *) typed="$typed$KEY" ;;
+      esac
+      continue
+    fi
+    case "$KEY" in
+      up|k) [ $n -gt 0 ] && sel=$(( (sel + n - 1) % n )) ;;
+      down|j) [ $n -gt 0 ] && sel=$(( (sel + 1) % n )) ;;
+      t|T) mode=type ;;
+      enter) if [ $n -gt 0 ]; then choose_iso "$(nth $((sel + 1)) "$@")"; return; fi ;;
+      esc|q) return ;;
+    esac
+  done
+}
+
+choose_iso() {
+  ISO_PATH="$1"; ISO_SIZE=$(fsize "$1"); ISO_VERIFIED=0; ISO_SHA=""
+  if is_verified "$1"; then ISO_VERIFIED=1; ISO_SHA="$REMOTE_SHA"; fi
+  MESSAGE="Image: $(basename "$1")"; MESSAGE_KIND=ok
+  if [ "$ISO_SIZE" -lt 100000000 ] 2>/dev/null; then MESSAGE="That file is only $(human "$ISO_SIZE") — is it really an ISO?"; MESSAGE_KIND=warn; fi
+}
+
+drive_screen() {
+  local sel=0 list n line
+  while true; do
+    list=$(list_drives)
+    [ "$SHOW_ALL" = 1 ] || list=$(printf '%s\n' "$list" | awk -F'|' '$4==1 && $5!=1 && $6!=1')
+    list=$(printf '%s\n' "$list" | sed '/^$/d')
+    n=0; [ -n "$list" ] && n=$(printf '%s\n' "$list" | wc -l | tr -d ' ')
+    [ $sel -ge $n ] && sel=0
+    layout; clear_screen; logo 2
+    local r=10
+    local h=$(( (n > 0 ? n * 2 : 3) + 4 ))
+    box $r $h "$CYAN" "CHOOSE THE USB DRIVE"
+    if [ $n -eq 0 ]; then
+      text_at $((r+2)) 3 "${CYAN}▣${R}  ${WHITE}${B}Plug in a USB stick${R} ${MUTED}(8 GB or bigger) — it shows up here automatically${R}"
+      [ "$SHOW_ALL" = 1 ] || text_at $((r+3)) 6 "${MUTED}Press${R} ${CYAN}a${R} ${MUTED}to show every disk${R}"
+    else
+      local i=0
+      while IFS='|' read -r dev size name rem sys ro mounts; do
+        local sub; sub="$(human "$size") · $dev"
+        local col="$WHITE"
+        if [ "$sys" = 1 ]; then sub="${RED}⊘ system disk — protected${R}"; col="$MUTED"
+        elif [ "$ro" = 1 ]; then sub="${RED}write protected${R}"; col="$MUTED"
+        elif [ "$rem" != 1 ]; then sub="$sub ${YELLOW}· internal disk — locked${R}"; col="$MUTED"; fi
+        [ -n "$mounts" ] && [ "$sys" != 1 ] && sub="$sub ${MUTED}· mounted ${mounts% }${R}"
+        local icon="▣"; [ "$rem" = 1 ] || icon="▤"
+        local mark="  "; [ "$dev" = "$DRIVE" ] && mark="${CYAN}✔${R} "
+        if [ $i -eq $sel ]; then
+          text_at $((r + 2 + i * 2)) 2 "${BGSEL}${PINK}${B} ▸ ${icon} ${R}${BGSEL}${col}${B}${name}${R} $mark"
+        else
+          text_at $((r + 2 + i * 2)) 2 "   ${PURPLE}${icon}${R} ${col}${name}${R} $mark"
+        fi
+        text_at $((r + 3 + i * 2)) 8 "${MUTED}${sub}${R}"
+        i=$((i+1))
+      done <<EOF
+$list
+EOF
+    fi
+    local all="show all disks"; [ "$SHOW_ALL" = 1 ] && all="USB only"
+    footer "↑/↓ move   Enter choose   r refresh   a $all   Esc back"
+    read_key 3
+    case "$KEY" in
+      up|k) [ $n -gt 0 ] && sel=$(( (sel + n - 1) % n )) ;;
+      down|j) [ $n -gt 0 ] && sel=$(( (sel + 1) % n )) ;;
+      a|A) if [ "$SHOW_ALL" = 1 ]; then SHOW_ALL=0; else SHOW_ALL=1; fi; sel=0 ;;
+      r|R|timeout) ;;
+      esc|q) return ;;
+      enter)
+        [ $n -gt 0 ] || continue
+        line=$(printf '%s\n' "$list" | sed -n "$((sel + 1))p")
+        if usable "$line"; then
+          IFS='|' read -r DRIVE DRIVE_SIZE DRIVE_NAME DRIVE_REMOVABLE _ _ _ <<EOF
+$line
+EOF
+          MESSAGE="Drive: $DRIVE_NAME ($DRIVE)"; MESSAGE_KIND=ok
+          if [ -n "$ISO_PATH" ] && [ "$DRIVE_SIZE" -lt "$ISO_SIZE" ] 2>/dev/null; then
+            MESSAGE="$DRIVE_NAME is too small ($(human "$DRIVE_SIZE")) for $(human "$ISO_SIZE")"; MESSAGE_KIND=err; DRIVE=""
+          fi
+          return
+        else
+          MESSAGE="That disk is locked (system, internal or write protected) — see Help"; MESSAGE_KIND=err
+        fi ;;
+    esac
+  done
+}
+
+confirm_screen() {
+  local want typed=""
+  want="${DRIVE##*/}"
+  while true; do
+    layout; clear_screen; logo 2
+    local r=10
+    box $r 11 "$RED" "⚠  ERASE THIS DRIVE?"
+    text_at $((r+2)) 3 "${WHITE}${B}$DRIVE_NAME${R}  ${MUTED}$(human "$DRIVE_SIZE") · $DRIVE${R}"
+    [ "${DRIVE_REMOVABLE:-1}" = 1 ] || text_at $((r+3)) 3 "${RED}${B}This is NOT a removable drive. Check twice.${R}"
+    text_at $((r+4)) 3 "Everything on it will be ${RED}${B}permanently deleted${R} and replaced with"
+    text_at $((r+5)) 3 "${CYAN}$(basename "$ISO_PATH")${R} ${MUTED}($(human "$ISO_SIZE"))${R}."
+    text_at $((r+7)) 3 "Type ${YELLOW}${B}$want${R} and press Enter to continue:  ${WHITE}${typed}${PINK}▏${R}"
+    text_at $((r+8)) 3 "${MUTED}You'll be asked for your password (sudo) to allow writing.${R}"
+    footer "Type the drive name to confirm   Esc cancel"
+    read_key
+    case "$KEY" in
+      esc) MESSAGE="Cancelled — nothing was written"; MESSAGE_KIND=warn; return 1 ;;
+      enter) if [ "$typed" = "$want" ]; then return 0; fi; typed="" ;;
+      backspace) typed="${typed%?}" ;;
+      up|down|left|right|space|timeout) ;;
+      *) typed="$typed$KEY" ;;
+    esac
+  done
+}
+
+help_screen() {
+  layout; clear_screen; logo 2
+  local r=10
+  box $r 13 "$PURPLE" "HELP"
+  text_at $((r+1)) 3 "${WHITE}${B}1.${R} ${CYAN}Download${R} gets the latest Tom OS from github.com/$OWNER/$REPO"
+  text_at $((r+2)) 3 "   in parts, checks each part and the whole ISO with SHA-256 and keeps it in"
+  text_at $((r+3)) 3 "   ${MUTED}$DL_DIR${R}. Press q while downloading to pause; it resumes."
+  text_at $((r+4)) 3 "${WHITE}${B}2.${R} ${CYAN}Choose the USB drive${R}. Only removable drives are listed; your system"
+  text_at $((r+5)) 3 "   and internal disks are locked. Press ${CYAN}a${R} to see every disk."
+  text_at $((r+6)) 3 "${WHITE}${B}3.${R} ${CYAN}Burn${R}: type the drive name to confirm, enter your password, wait."
+  text_at $((r+7)) 3 "   The stick is unmounted, written with dd and read back to verify."
+  text_at $((r+9)) 3 "${PINK}Boot it:${R} restart and press F12, F11, F8 or Esc for the boot menu."
+  text_at $((r+10)) 3 "${MUTED}Tom OS is for 64-bit PCs (x86_64). Intel Macs: hold Option at startup.${R}"
+  text_at $((r+11)) 3 "${MUTED}Command line: tomos-installer-tui --help${R}"
+  footer "Press any key to go back"
+  read_key
+}
+
+# ------------------------------------------------------------------ burning
+ask_password() {
+  [ -n "$SUDO" ] || return 0
+  sudo -n true 2>/dev/null && { keepalive; return 0; }
+  leave_tui
+  printf '\n%s%s Tom OS Installer%s needs administrator rights to write to %s%s%s.\n' "$PINK" "$B" "$R" "$B" "$DRIVE" "$R"
+  sudo -v -p "  [sudo] password for %u: " || { enter_tui; MESSAGE="No password given — nothing was written"; MESSAGE_KIND=warn; return 1; }
+  enter_tui
+  keepalive
+}
+
+keepalive() {
+  [ -n "$SUDO" ] || return
+  ( while true; do sleep 50; sudo -n true 2>/dev/null || exit; done ) &
+  SUDO_KEEPALIVE=$!
+}
+
+burn() {
+  ask_password || return 1
+  local dev="$DRIVE" wdev="$DRIVE" iso="$ISO_PATH" size="$ISO_SIZE"
+  [ "$PLATFORM" = mac ] && wdev="/dev/r${DRIVE#/dev/}"
+  local s1 s2 s3 s4
+  s_lines() { # $1..$4 states for unmount/write/verify/finish
+    s1=$(step "$1" "Unmount $dev"); s2=$(step "$2" "Write $(basename "$iso")")
+    if [ "$VERIFY" = 1 ]; then s3=$(step "$3" "Read back and verify"); else s3=$(step skip "Verify (off)"); fi
+    s4=$(step "$4" "Finish")
+    STEPS=("$s1" "$s2" "$s3" "$s4")
+  }
+  # 1. unmount
+  s_lines now todo todo todo
+  progress_screen "BURNING TOM OS" "$DRIVE_NAME · $dev" 0 "$size" "$(now)" "${STEPS[@]}"
+  if [ -z "$TOMOS_TUI_FAKE_DRIVES" ]; then
+    if [ "$PLATFORM" = linux ]; then
+      local p
+      for p in $(lsblk -nrpo NAME,MOUNTPOINT "$dev" 2>/dev/null | awk '$2!=""{print $1}'); do
+        $SUDO umount "$p" 2>/dev/null || $SUDO umount -l "$p" 2>/dev/null || { burn_failed "Could not unmount $p — close any files open on the stick"; return 1; }
+      done
+      $SUDO swapoff "$dev"* 2>/dev/null
+    elif [ "$PLATFORM" = mac ]; then
+      diskutil unmountDisk force "$dev" >/dev/null 2>&1 || { burn_failed "diskutil could not unmount $dev"; return 1; }
+    fi
+  fi
+  # 2. write
+  s_lines done now todo todo
+  local oflag="" conv; conv=$(write_flags)
+  [ "$PLATFORM" = linux ] && [ -z "$TOMOS_TUI_FAKE_DRIVES" ] && oflag="oflag=direct"
+  run_dd "BURNING TOM OS" "$DRIVE_NAME · $dev" "$size"  \
+    "$SUDO dd if='$iso' of='$wdev' bs=$BS $oflag $conv $(dd_status)"
+  local rc=$?
+  if [ $rc -ne 0 ] && grep -q 'Invalid argument' "$DDLOG" 2>/dev/null && [ -n "$oflag" ]; then
+    run_dd "BURNING TOM OS" "$DRIVE_NAME · $dev (buffered)" "$size"  \
+      "$SUDO dd if='$iso' of='$wdev' bs=$BS $conv $(dd_status)"
+    rc=$?
+  fi
+  if [ $rc -ne 0 ]; then
+    burn_failed "Writing failed: $(tr '\r' '\n' <"$DDLOG" | grep -v 'bytes\|records' | tail -n1)"; return 1
+  fi
+  sync
+  # 3. verify
+  if [ "$VERIFY" = 1 ]; then
+    s_lines done done now todo
+    if [ -z "$ISO_SHA" ]; then
+      run_dd "CHECKING THE IMAGE" "SHA-256 of $(basename "$iso") (needed to verify the stick)" "$size"  \
+        "dd if='$iso' bs=$BS $(dd_status) | $(sha_cmd) > '$WORK/isosum'"
+      ISO_SHA=$(cut -d' ' -f1 <"$WORK/isosum")
+    fi
+    [ "$PLATFORM" = linux ] && [ -z "$TOMOS_TUI_FAKE_DRIVES" ] && $SUDO blockdev --flushbufs "$dev" 2>/dev/null
+    local count=$(( (size + BS - 1) / BS ))
+    local iflag; iflag=$(read_flag "$dev")
+    run_dd "VERIFYING THE USB STICK" "$DRIVE_NAME · $dev" "$size"  \
+      "$SUDO dd if='$wdev' bs=$BS count=$count $iflag $(dd_status) | head -c $size | $(sha_cmd) > '$WORK/devsum'"
+    local got; got=$(cut -d' ' -f1 <"$WORK/devsum")
+    if [ "$got" != "$ISO_SHA" ]; then
+      burn_failed "Verification failed: the stick does not match the image. It may be faulty or fake — try another one."; return 1
+    fi
+  fi
+  # 4. finish
+  s_lines done done done now
+  progress_screen "BURNING TOM OS" "Finishing…" "$size" "$size" "$(now)" "${STEPS[@]}"
+  if [ -z "$TOMOS_TUI_FAKE_DRIVES" ]; then
+    if [ "$PLATFORM" = mac ]; then diskutil eject "$dev" >/dev/null 2>&1
+    else $SUDO partprobe "$dev" 2>/dev/null; sync; fi
+  fi
+  done_screen
+  return 0
+}
+
+burn_failed() {
+  MESSAGE="$1"; MESSAGE_KIND=err
+  layout; clear_screen; logo 2
+  box 10 8 "$RED" "SOMETHING WENT WRONG"
+  local m="$1"
+  text_at 12 3 "${WHITE}${m:0:$((W - 6))}${R}"
+  [ ${#m} -gt $((W - 6)) ] && text_at 13 3 "${WHITE}${m:$((W - 6)):$((W - 6))}${R}"
+  text_at 15 3 "${MUTED}The stick is probably incomplete and won't boot. Fix the problem and burn again.${R}"
+  footer "Press any key to go back"
+  read_key
+}
+
+done_screen() {
+  MESSAGE="Tom OS was written to $DRIVE"; MESSAGE_KIND=ok
+  layout; clear_screen; logo 2
+  local r=10
+  box $r 10 "$GREEN" "✔  TOM OS IS READY"
+  text_at $((r+2)) 3 "${WHITE}${B}Tom OS $TOMOS_VERSION${R} is on ${CYAN}$DRIVE_NAME${R} ${MUTED}($DRIVE)${R}"
+  [ "$VERIFY" = 1 ] && text_at $((r+3)) 3 "${GREEN}Every byte was read back and matches the image.${R}"
+  text_at $((r+5)) 3 "${PINK}Next:${R} restart with the stick plugged in and open the boot menu"
+  text_at $((r+6)) 3 "      ${MUTED}(F12, F11, F8 or Esc on most PCs — Intel Macs: hold Option).${R}"
+  text_at $((r+7)) 3 "      Pick the USB stick, then ${CYAN}Install Tom OS${R} from the desktop."
+  footer "Press any key to go back to the menu"
+  DRIVE=""; DRIVE_NAME=""; DRIVE_SIZE=0
+  read_key
+}
+
+# ------------------------------------------------------------------ command line
+usage() {
+  cat <<EOF
+${PINK}${B}Tom OS Installer TUI${R} $TUI_VERSION — download Tom OS and burn it to a USB stick
+
+${B}USAGE${R}
+  tomos-installer-tui                     open the full-screen app
+  tomos-installer-tui --list [--all]      list USB drives
+  tomos-installer-tui --info              show the latest Tom OS release
+  tomos-installer-tui --download          download + verify the ISO into $DL_DIR
+  tomos-installer-tui --burn DEVICE [--iso FILE] [--no-verify] [--yes]
+                                          burn (downloads first when --iso is not given)
+  tomos-installer-tui --update            update this tool
+  tomos-installer-tui --uninstall         remove this tool
+  tomos-installer-tui --version | --help
+
+${B}EXAMPLES${R}
+  tomos-installer-tui --burn /dev/sdb               ${MUTED}# Linux${R}
+  tomos-installer-tui --burn /dev/disk4 --iso ~/Downloads/tomos-26.10-amd64.iso   ${MUTED}# macOS${R}
+
+${B}ENVIRONMENT${R}
+  TOMOS_TUI_DIR            where downloads are kept (default: $DL_DIR)
+  TOMOS_TUI_ALLOW_DEVICE   extra device(s) to offer, e.g. a card reader not seen as USB
+  NO_COLOR        disable colours
+EOF
+}
+
+cli_list() {
+  local all=$1 any=0
+  printf '%-14s %10s  %-34s %s\n' DEVICE SIZE NAME NOTE
+  while IFS='|' read -r dev size name rem sys ro mounts; do
+    [ -n "$dev" ] || continue
+    if [ "$all" != 1 ] && { [ "$rem" != 1 ] || [ "$sys" = 1 ] || [ "$ro" = 1 ]; }; then continue; fi
+    local note=""
+    [ "$sys" = 1 ] && note="system disk (protected)"
+    [ "$ro" = 1 ] && note="write protected"
+    [ -z "$note" ] && [ "$rem" != 1 ] && note="internal"
+    [ -z "$note" ] && [ -n "$mounts" ] && note="mounted: $mounts"
+    printf '%-14s %10s  %-34.34s %s\n' "$dev" "$(human "$size")" "$name" "$note"
+    any=1
+  done <<EOF
+$(list_drives)
+EOF
+  [ $any = 1 ] || echo "No USB drives found — plug in a USB stick (8 GB or bigger)."
+}
+
+cli_download() {
+  printf '%s==>%s Checking the latest Tom OS release…\n' "$PINK$B" "$R" >&2
+  fetch_manifest || die "$(cat "$WORK/manifest.err")"
+  printf '    Tom OS %s — %s (%s)\n' "$TOMOS_VERSION" "$ISO_NAME" "$(human "$TOTAL_SIZE")" >&2
+  local iso="$DL_DIR/$ISO_NAME"
+  if is_verified "$iso"; then ISO_PATH="$iso"; ISO_SIZE=$(fsize "$iso"); ISO_VERIFIED=1; ISO_SHA="$REMOTE_SHA"; echo "Already downloaded: $iso" >&2; return 0; fi
+  mkdir -p "$DL_DIR" || die "can't create $DL_DIR"
+  local tmp="$iso.download" i=1 p h
+  : >"$tmp"
+  set -- $PART_NAMES
+  for p in "$@"; do
+    h=$(nth $i $PART_SUMS)
+    printf '%s==>%s Part %d of %d: %s\n' "$PINK$B" "$R" "$i" "$#" "$p" >&2
+    curl -fL --retry 5 --retry-delay 3 -C - --progress-bar -o "$DL_DIR/.$p" "$LFS_BASE/$p" || die "download failed — run the same command again to resume"
+    [ "$(sha256 <"$DL_DIR/.$p")" = "$h" ] || { rm -f "$DL_DIR/.$p"; die "part $i failed its SHA-256 check"; }
+    cat "$DL_DIR/.$p" >>"$tmp" && rm -f "$DL_DIR/.$p"
+    i=$((i+1))
+  done
+  printf '%s==>%s Verifying the whole image…\n' "$PINK$B" "$R" >&2
+  [ "$(sha256 <"$tmp")" = "$REMOTE_SHA" ] || die "the image does not match the published SHA-256"
+  mv -f "$tmp" "$iso" && printf '%s %s\n' "$REMOTE_SHA" "$(fsize "$iso")" >"$iso.verified"
+  ISO_PATH="$iso"; ISO_SIZE=$(fsize "$iso"); ISO_VERIFIED=1; ISO_SHA="$REMOTE_SHA"
+  printf '%s✔%s Saved to %s\n' "$GREEN$B" "$R" "$iso" >&2
+}
+
+cli_burn() {
+  local dev="$1" iso="$2" yes="$3" line
+  [ -n "$dev" ] || die "--burn needs a device (see --list)"
+  line=$(list_drives | awk -F'|' -v d="$dev" '$1==d')
+  [ -n "$line" ] || die "no drive called $dev (see --list --all)"
+  IFS='|' read -r DRIVE DRIVE_SIZE DRIVE_NAME DRIVE_REMOVABLE sys ro _ <<EOF
+$line
+EOF
+  [ "$sys" = 1 ] && die "$dev holds your running system — refusing"
+  [ "$ro" = 1 ] && die "$dev is write protected"
+  [ "$DRIVE_REMOVABLE" = 1 ] || die "$dev is an internal disk, not a USB stick — refusing. If you really mean it: TOMOS_TUI_ALLOW_DEVICE=$dev"
+  if [ -n "$iso" ]; then
+    [ -f "$iso" ] || die "no such file: $iso"
+    ISO_PATH="$iso"; ISO_SIZE=$(fsize "$iso")
+    fetch_manifest >/dev/null 2>&1 && is_verified "$iso" && ISO_SHA="$REMOTE_SHA" && ISO_VERIFIED=1
+  else
+    cli_download
+  fi
+  [ "$DRIVE_SIZE" -ge "$ISO_SIZE" ] 2>/dev/null || die "$dev is too small ($(human "$DRIVE_SIZE")) for $(human "$ISO_SIZE")"
+  if [ "$yes" != 1 ]; then
+    printf '\n%sWARNING:%s everything on %s%s%s — %s (%s) will be erased.\n' "$YELLOW$B" "$R" "$B" "$dev" "$R" "$DRIVE_NAME" "$(human "$DRIVE_SIZE")" >&2
+    [ "$DRIVE_REMOVABLE" = 1 ] || printf '%sThis is NOT a removable drive.%s\n' "$RED$B" "$R" >&2
+    printf 'Type %s to continue: ' "${dev##*/}" >&2
+    local ans; read -r ans </dev/tty
+    [ "$ans" = "${dev##*/}" ] || die "cancelled, nothing was written"
+  fi
+  if [ -n "$SUDO" ]; then sudo -v || die "sudo is needed to write to $dev"; keepalive; fi
+  burn_cli
+}
+
+burn_cli() {
+  # same steps as burn(), plain output
+  local dev="$DRIVE" wdev="$DRIVE"
+  [ "$PLATFORM" = mac ] && wdev="/dev/r${DRIVE#/dev/}"
+  printf '%s==>%s Unmounting %s\n' "$PINK$B" "$R" "$dev" >&2
+  if [ -z "$TOMOS_TUI_FAKE_DRIVES" ]; then
+    if [ "$PLATFORM" = linux ]; then
+      for p in $(lsblk -nrpo NAME,MOUNTPOINT "$dev" 2>/dev/null | awk '$2!=""{print $1}'); do
+        $SUDO umount "$p" 2>/dev/null || $SUDO umount -l "$p" || die "could not unmount $p"
+      done
+    else
+      diskutil unmountDisk force "$dev" >/dev/null || die "could not unmount $dev"
+    fi
+  fi
+  printf '%s==>%s Writing %s\n' "$PINK$B" "$R" "$(basename "$ISO_PATH")" >&2
+  local oflag="" conv=""
+  conv=$(write_flags)
+  [ "$PLATFORM" = linux ] && [ -z "$TOMOS_TUI_FAKE_DRIVES" ] && oflag="oflag=direct"
+  run_dd x x "$ISO_SIZE" "$SUDO dd if='$ISO_PATH' of='$wdev' bs=$BS $oflag $conv $(dd_status)" || die "writing failed: $(tr '\r' '\n' <"$DDLOG" | tail -n1)"
+  sync
+  if [ "$VERIFY" = 1 ]; then
+    if [ -z "$ISO_SHA" ]; then
+      printf '%s==>%s Hashing the image\n' "$PINK$B" "$R" >&2
+      ISO_SHA=$(sha256 <"$ISO_PATH")
+    fi
+    printf '%s==>%s Verifying the stick\n' "$PINK$B" "$R" >&2
+    [ "$PLATFORM" = linux ] && [ -z "$TOMOS_TUI_FAKE_DRIVES" ] && $SUDO blockdev --flushbufs "$dev" 2>/dev/null
+    local count=$(( (ISO_SIZE + BS - 1) / BS )) iflag; iflag=$(read_flag "$dev")
+    run_dd x x "$ISO_SIZE" "$SUDO dd if='$wdev' bs=$BS count=$count $iflag $(dd_status) | head -c $ISO_SIZE | $(sha_cmd) > '$WORK/devsum'"
+    [ "$(cut -d' ' -f1 <"$WORK/devsum")" = "$ISO_SHA" ] || die "verification failed: the stick does not match the image"
+    printf '    every byte matches\n' >&2
+  fi
+  if [ -z "$TOMOS_TUI_FAKE_DRIVES" ] && [ "$PLATFORM" = mac ]; then diskutil eject "$dev" >/dev/null 2>&1; fi
+  printf '%s✔%s Tom OS is on %s — boot from it with F12 / F11 / F8 / Esc\n' "$GREEN$B" "$R" "$dev" >&2
+}
+
+self_update() {
+  local me; me=$(command -v tomos-installer-tui || echo "$0")
+  curl -fsSL "https://raw.githubusercontent.com/Spruhantom/tomos-installer-tui/main/install.sh" | bash
+}
+
+self_uninstall() {
+  local me; me=$(command -v tomos-installer-tui || echo "$0")
+  rm -f "$me" "$HOME/.local/share/applications/tomos-installer-tui.desktop" 2>/dev/null ||
+    sudo rm -f "$me"
+  echo "Removed $me (downloaded ISOs in $DL_DIR were kept)."
+}
+
+check_deps() {
+  local missing="" c
+  for c in curl dd awk sed; do have "$c" || missing="$missing $c"; done
+  have sha256sum || have shasum || missing="$missing sha256sum"
+  [ "$PLATFORM" = linux ] && { have lsblk || missing="$missing lsblk(util-linux)"; }
+  [ "$PLATFORM" = mac ] && { have diskutil || missing="$missing diskutil"; }
+  [ -z "$SUDO" ] || have sudo || missing="$missing sudo"
+  [ -z "$missing" ] || die "missing tools:$missing"
+}
+
+main() {
+  local burn_dev="" iso="" yes=0 all=0 action=tui
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help) usage; exit 0 ;;
+      -V|--version) echo "tomos-installer-tui $TUI_VERSION"; exit 0 ;;
+      --list|-l) action=list ;;
+      --all) all=1; SHOW_ALL=1 ;;
+      --info) action=info ;;
+      --download) action=download ;;
+      --burn) action=burn; burn_dev="$2"; shift ;;
+      --iso) iso="$2"; shift ;;
+      --yes|-y) yes=1 ;;
+      --no-verify) VERIFY=0 ;;
+      --update) self_update; exit $? ;;
+      --uninstall) self_uninstall; exit $? ;;
+      --demo-screen) action=demo; DEMO_SCREEN="$2"; shift ;;
+      *) usage >&2; die "unknown option: $1" ;;
+    esac
+    shift
+  done
+  [ "$PLATFORM" != other ] || die "unsupported system: $OS. On Windows use PowerShell: irm https://raw.githubusercontent.com/Spruhantom/tomos-installer-tui/main/install.ps1 | iex"
+  check_deps
+  case "$action" in
+    list) cli_list "$all" ;;
+    info) fetch_manifest || die "$(cat "$WORK/manifest.err")"
+          echo "Tom OS $TOMOS_VERSION  (github.com/$OWNER/$REPO)"
+          echo "ISO      $ISO_NAME  $(human "$TOTAL_SIZE")"
+          echo "SHA-256  $REMOTE_SHA"
+          i=1; for p in $PART_NAMES; do echo "  $p  $(human "$(nth $i $PART_SIZES)")"; i=$((i+1)); done ;;
+    download) cli_download ;;
+    burn) cli_burn "$burn_dev" "$iso" "$yes" ;;
+    demo) demo "$DEMO_SCREEN" ;;
+    tui)
+      [ -t 0 ] && [ -t 1 ] || die "run this in a terminal (or see --help for command-line use)"
+      ( fetch_manifest >/dev/null 2>&1 ) &
+      enter_tui
+      trap 'layout' WINCH
+      menu_screen
+      leave_tui
+      printf '%sTom OS Installer TUI%s — bye.\n' "$PINK$B" "$R"
+      ;;
+  esac
+}
+
+# Screens with sample data, used to make the screenshots in the README.
+demo() {
+  enter_tui
+  TOMOS_VERSION=26.10; ISO_NAME=tomos-26.10-amd64.iso; TOTAL_SIZE=2761211904; REMOTE_SHA=x
+  local iso="$HOME/Downloads/TomOS/tomos-26.10-amd64.iso"
+  case "$1" in
+    menu) MESSAGE="Downloaded and verified Tom OS 26.10 → $iso"; MESSAGE_KIND=ok
+          ISO_PATH="$iso"; ISO_SIZE=2761211904; ISO_VERIFIED=1 ;;
+    menu-empty) ;;
+    menu-ready) ISO_PATH="$iso"; ISO_SIZE=2761211904; ISO_VERIFIED=1; DRIVE=/dev/sdb; DRIVE_NAME="SanDisk Ultra Fit"; DRIVE_SIZE=32017047552
+                MESSAGE="Drive: SanDisk Ultra Fit (/dev/sdb)"; MESSAGE_KIND=ok ;;
+  esac
+  case "$1" in
+    menu|menu-empty|menu-ready) printf '%s\n' "$TOMOS_VERSION|$ISO_NAME|$REMOTE_SHA|$TOTAL_SIZE|||" >"$WORK/manifest"; menu_screen ;;
+    drives) ISO_PATH="$iso"; ISO_SIZE=2761211904; drive_screen ;;
+    confirm) ISO_PATH="$iso"; ISO_SIZE=2761211904; DRIVE=/dev/sdb; DRIVE_NAME="SanDisk Ultra Fit"; DRIVE_SIZE=32017047552; DRIVE_REMOVABLE=1; confirm_screen ;;
+    download) local s1 s2 s3; s1=$(step done "Part 1 of 3  tomos-26.10-amd64.iso.part1"); s2=$(step now "Part 2 of 3  tomos-26.10-amd64.iso.part2"); s3=$(step todo "Part 3 of 3  tomos-26.10-amd64.iso.part3")
+              progress_screen "DOWNLOADING TOM OS 26.10" "from github.com/$OWNER/$REPO  →  $HOME/Downloads/TomOS" 1471000000 2761211904 $(( $(now) - 74 )) "$s1" "$s2" "$s3"; read_key ;;
+    burn) local a b c d; a=$(step done "Unmount /dev/sdb"); b=$(step now "Write tomos-26.10-amd64.iso"); c=$(step todo "Read back and verify"); d=$(step todo "Finish")
+          progress_screen "BURNING TOM OS" "SanDisk Ultra Fit · /dev/sdb" 1610612736 2761211904 $(( $(now) - 82 )) "$a" "$b" "$c" "$d"; read_key ;;
+    verify) local a b c d; a=$(step done "Unmount /dev/sdb"); b=$(step done "Write tomos-26.10-amd64.iso"); c=$(step now "Read back and verify"); d=$(step todo "Finish")
+          progress_screen "VERIFYING THE USB STICK" "SanDisk Ultra Fit · /dev/sdb" 2200000000 2761211904 $(( $(now) - 40 )) "$a" "$b" "$c" "$d"; read_key ;;
+    done) DRIVE=/dev/sdb; DRIVE_NAME="SanDisk Ultra Fit"; done_screen ;;
+    help) help_screen ;;
+    error) burn_failed "Verification failed: the stick does not match the image. It may be faulty or fake — try another one." ;;
+  esac
+}
+
+main "$@"

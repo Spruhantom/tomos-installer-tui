@@ -1,0 +1,217 @@
+name: test
+
+# Every push burns a small test image to a real block device on all three systems:
+#   Linux   - a loop device          (/dev/loopN)
+#   macOS   - a RAM disk             (/dev/diskN, written through /dev/rdiskN)
+#   Windows - an attached VHD disk   (\\.\PhysicalDriveN), with Windows PowerShell 5.1 and PowerShell 7
+# The "release" is served by a local web server with the same layout as the Tom OS repo
+# (download/<iso>.sha256, download/parts.sha256, download/<iso>.partN), so the download,
+# resume and SHA-256 checks run for real too.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  unix:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Syntax and lint
+        run: |
+          /bin/bash --version | head -n1
+          /bin/bash -n tomos-installer-tui
+          /bin/bash -n install.sh
+          if command -v shellcheck >/dev/null; then shellcheck -S error tomos-installer-tui install.sh; fi
+
+      - name: Make a test release and serve it
+        run: |
+          mkdir -p srv/download
+          cd srv/download
+          python3 - <<'EOF'
+          import os, hashlib
+          data = os.urandom(9000000)          # not a multiple of 512 on purpose
+          open('/tmp/test.iso', 'wb').write(data)
+          name = 'tomos-test-amd64.iso'
+          parts = [data[i:i + 4000000] for i in range(0, len(data), 4000000)]
+          with open('parts.sha256', 'w') as f:
+              for n, p in enumerate(parts, 1):
+                  open(f'{name}.part{n}', 'wb').write(p)
+                  f.write(f'{hashlib.sha256(p).hexdigest()}  {name}.part{n}\n')
+          open(f'{name}.sha256', 'w').write(f'{hashlib.sha256(data).hexdigest()}  {name}\n')
+          EOF
+          cp ../../tomos-installer-tui ../
+          cd ..
+          (python3 -m http.server 8765 >/tmp/http.log 2>&1 &)
+          sleep 2
+          curl -fsS http://127.0.0.1:8765/download/parts.sha256
+
+      - name: Install with the one-liner script
+        run: |
+          TOMOS_TUI_URL=http://127.0.0.1:8765/tomos-installer-tui /bin/bash install.sh
+          ~/.local/bin/tomos-installer-tui --version
+
+      - name: Real release metadata from GitHub
+        run: /bin/bash ./tomos-installer-tui --info
+
+      - name: Download, resume and verify
+        env:
+          TOMOS_TUI_BASE_URL: http://127.0.0.1:8765
+          TOMOS_TUI_VERSION: test
+          TOMOS_TUI_DIR: /tmp/dl
+        run: |
+          # start a download of part 1 and cut it off, so the next run has to resume
+          mkdir -p /tmp/dl
+          curl -fsS -r 0-999999 -o /tmp/dl/.tomos-test-amd64.iso.part1 http://127.0.0.1:8765/download/tomos-test-amd64.iso.part1
+          /bin/bash ./tomos-installer-tui --download
+          cmp /tmp/dl/tomos-test-amd64.iso /tmp/test.iso
+          # second run must notice the verified file and skip
+          /bin/bash ./tomos-installer-tui --download 2>&1 | tee /tmp/second.log
+          grep -q 'Already downloaded' /tmp/second.log
+
+      - name: Make a block device (Linux loop device)
+        if: runner.os == 'Linux'
+        run: |
+          truncate -s 64M /tmp/stick.img
+          DEV=$(sudo losetup -f --show /tmp/stick.img)
+          echo "DEV=$DEV" >> "$GITHUB_ENV"
+
+      - name: Make a block device (macOS RAM disk)
+        if: runner.os == 'macOS'
+        run: |
+          DEV=$(hdiutil attach -nomount ram://131072 | awk '{print $1; exit}')
+          echo "DEV=$DEV" >> "$GITHUB_ENV"
+          diskutil info "$DEV" | head -n 20
+
+      - name: List drives
+        run: |
+          /bin/bash ./tomos-installer-tui --list --all
+          TOMOS_TUI_ALLOW_DEVICE="$DEV" /bin/bash ./tomos-installer-tui --list | tee /tmp/list.txt
+          grep -q "$DEV" /tmp/list.txt
+
+      - name: Burn and verify
+        env:
+          TOMOS_TUI_BASE_URL: http://127.0.0.1:8765
+          TOMOS_TUI_VERSION: test
+          TOMOS_TUI_DIR: /tmp/dl
+        run: |
+          TOMOS_TUI_ALLOW_DEVICE="$DEV" /bin/bash ./tomos-installer-tui --burn "$DEV" --iso /tmp/dl/tomos-test-amd64.iso --yes
+          if [ "$RUNNER_OS" = Linux ]; then
+            sudo cmp -n 9000000 "$DEV" /tmp/test.iso && echo "independent check: device matches"
+          fi
+
+      - name: Refuses the system disk
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then SYS=$(lsblk -no PKNAME "$(findmnt -no SOURCE /)" | head -n1); SYS="/dev/$SYS"
+          else SYS=/dev/$(diskutil info / | awk -F: '/Part of Whole/{gsub(/ /,"",$2); print $2}'); fi
+          echo "system disk: $SYS"
+          if /bin/bash ./tomos-installer-tui --burn "$SYS" --iso /tmp/test.iso --yes; then echo "should have refused"; exit 1; fi
+
+  windows:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [powershell, pwsh]
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse
+        run: |
+          $PSVersionTable.PSVersion
+          foreach ($f in 'tomos-installer-tui.ps1', 'install.ps1') {
+            $e = $null; $t = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $f), [ref]$t, [ref]$e)
+            if ($e) { $e | ForEach-Object { "$f $($_.Extent.StartLineNumber): $($_.Message)" }; exit 1 }
+          }
+
+      - name: Make a test release and serve it
+        run: |
+          New-Item -ItemType Directory -Force srv\download | Out-Null
+          python -c "
+          import os, hashlib
+          data = os.urandom(9000000)
+          open(r'C:\test.iso', 'wb').write(data)
+          name = 'tomos-test-amd64.iso'
+          parts = [data[i:i + 4000000] for i in range(0, len(data), 4000000)]
+          with open(r'srv\download\parts.sha256', 'w', newline='\n') as f:
+              for n, p in enumerate(parts, 1):
+                  open(rf'srv\download\{name}.part{n}', 'wb').write(p)
+                  f.write(f'{hashlib.sha256(p).hexdigest()}  {name}.part{n}\n')
+          open(rf'srv\download\{name}.sha256', 'w', newline='\n').write(f'{hashlib.sha256(data).hexdigest()}  {name}\n')
+          "
+          Copy-Item tomos-installer-tui.ps1 srv\
+          Start-Process python -ArgumentList '-m', 'http.server', '8765', '--directory', 'srv' -WindowStyle Hidden
+          Start-Sleep 3
+          (Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8765/download/parts.sha256).Content
+
+      - name: Install with the one-liner script
+        run: |
+          $env:TOMOS_TUI_URL = 'http://127.0.0.1:8765/tomos-installer-tui.ps1'
+          Get-Content -Raw install.ps1 | Invoke-Expression
+          & "$env:LOCALAPPDATA\TomOS\installer-tui\bin\tomos-installer-tui.cmd" --version
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Test-Path "$([Environment]::GetFolderPath('Programs'))\Tom OS Installer TUI.lnk"
+
+      - name: Real release metadata from GitHub
+        run: .\tomos-installer-tui.ps1 --info
+
+      - name: Download, resume and verify
+        run: |
+          $env:TOMOS_TUI_BASE_URL = 'http://127.0.0.1:8765'; $env:TOMOS_TUI_VERSION = 'test'; $env:TOMOS_TUI_DIR = 'C:\dl'
+          New-Item -ItemType Directory -Force C:\dl | Out-Null
+          curl.exe -fsS -r 0-999999 -o C:\dl\.tomos-test-amd64.iso.part1 http://127.0.0.1:8765/download/tomos-test-amd64.iso.part1
+          .\tomos-installer-tui.ps1 --download
+          if ((Get-FileHash C:\dl\tomos-test-amd64.iso).Hash -ne (Get-FileHash C:\test.iso).Hash) { throw 'download differs' }
+          .\tomos-installer-tui.ps1 --download 2>&1 | Out-String | Tee-Object -Variable second
+          if ($second -notmatch 'Already downloaded') { throw 'second run did not reuse the download' }
+
+      - name: Attach a virtual disk
+        run: |
+          "create vdisk file=C:\stick.vhd maximum=64 type=fixed`r`nselect vdisk file=C:\stick.vhd`r`nattach vdisk`r`n" | Set-Content -Encoding ASCII C:\vd.txt
+          diskpart /s C:\vd.txt
+          Start-Sleep 3
+          $d = Get-Disk | Where-Object { $_.Location -like '*stick.vhd*' -or $_.BusType -eq 'File Backed Virtual' } | Select-Object -First 1
+          Get-Disk | Format-Table Number, FriendlyName, BusType, Size, IsBoot, IsSystem
+          if (-not $d) { throw 'no virtual disk' }
+          Add-Content -Encoding ascii -Path $env:GITHUB_ENV -Value "DISK=$($d.Number)"
+
+      - name: List drives
+        run: |
+          .\tomos-installer-tui.ps1 --list --all
+          $env:TOMOS_TUI_ALLOW_DEVICE = $env:DISK
+          $out = .\tomos-installer-tui.ps1 --list | Out-String
+          $out
+          if ($out -notmatch "(?m)^$($env:DISK)\s") { throw 'virtual disk not listed' }
+
+      - name: Burn and verify
+        run: |
+          $env:TOMOS_TUI_ALLOW_DEVICE = $env:DISK
+          .\tomos-installer-tui.ps1 --burn $env:DISK --iso C:\dl\tomos-test-amd64.iso --yes
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          # independent read-back with Python
+          python -c "
+          import hashlib
+          want = hashlib.sha256(open(r'C:\test.iso','rb').read()).hexdigest()
+          with open(r'\\.\PhysicalDrive$env:DISK', 'rb') as f:
+              data = f.read(9000960)[:9000000]
+          got = hashlib.sha256(data).hexdigest()
+          print('device', got); print('iso   ', want)
+          assert got == want
+          "
+
+      - name: Refuses the Windows disk
+        run: |
+          $sys = (Get-Partition -DriveLetter ($env:SystemDrive.TrimEnd(':'))).DiskNumber
+          .\tomos-installer-tui.ps1 --burn $sys --iso C:\test.iso --yes
+          if ($LASTEXITCODE -eq 0) { throw 'should have refused' }
+          exit 0
