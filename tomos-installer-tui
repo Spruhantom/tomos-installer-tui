@@ -839,7 +839,7 @@ burn() {
   s_lines done done done now
   progress_screen "BURNING TOM OS" "Finishing…" "$size" "$size" "$(now)" "${STEPS[@]}"
   if [ -z "$TOMOS_TUI_FAKE_DRIVES" ]; then
-    if [ "$PLATFORM" = mac ]; then diskutil eject "$dev" >/dev/null 2>&1
+    if [ "$PLATFORM" = mac ]; then [ -n "${TOMOS_TUI_NO_EJECT:-}" ] || diskutil eject "$dev" >/dev/null 2>&1
     else $SUDO partprobe "$dev" 2>/dev/null; sync; fi
   fi
   done_screen
@@ -1006,7 +1006,7 @@ burn_cli() {
     [ "$(cut -d' ' -f1 <"$WORK/devsum")" = "$ISO_SHA" ] || die "verification failed: the stick does not match the image"
     printf '    every byte matches\n' >&2
   fi
-  if [ -z "$TOMOS_TUI_FAKE_DRIVES" ] && [ "$PLATFORM" = mac ]; then diskutil eject "$dev" >/dev/null 2>&1; fi
+  if [ -z "$TOMOS_TUI_FAKE_DRIVES" ] && [ "$PLATFORM" = mac ]; then [ -n "${TOMOS_TUI_NO_EJECT:-}" ] || diskutil eject "$dev" >/dev/null 2>&1; fi
   printf '%s✔%s Tom OS is on %s — boot from it with F12 / F11 / F8 / Esc\n' "$GREEN$B" "$R" "$dev" >&2
 }
 

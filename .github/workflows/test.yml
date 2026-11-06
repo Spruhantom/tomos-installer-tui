@@ -101,16 +101,22 @@ jobs:
           TOMOS_TUI_VERSION: test
           TOMOS_TUI_DIR: /tmp/dl
         run: |
-          TOMOS_TUI_ALLOW_DEVICE="$DEV" /bin/bash ./tomos-installer-tui --burn "$DEV" --iso /tmp/dl/tomos-test-amd64.iso --yes
-          if [ "$RUNNER_OS" = Linux ]; then
-            sudo cmp -n 9000000 "$DEV" /tmp/test.iso && echo "independent check: device matches"
-          fi
+          # TOMOS_TUI_NO_EJECT keeps the macOS RAM disk attached (ejecting it would delete it)
+          TOMOS_TUI_NO_EJECT=1 TOMOS_TUI_ALLOW_DEVICE="$DEV" /bin/bash ./tomos-installer-tui --burn "$DEV" --iso /tmp/dl/tomos-test-amd64.iso --yes
+          sudo cmp -n 9000000 "$DEV" /tmp/test.iso
+          echo "independent check: device matches"
 
       - name: Refuses the system disk
         run: |
           if [ "$RUNNER_OS" = Linux ]; then SYS=$(lsblk -no PKNAME "$(findmnt -no SOURCE /)" | head -n1); SYS="/dev/$SYS"
-          else SYS=/dev/$(diskutil info / | awk -F: '/Part of Whole/{gsub(/ /,"",$2); print $2}'); fi
+          else
+            CONT=$(diskutil info / | awk -F: '/Part of Whole/{gsub(/ /,"",$2); print $2}')
+            STORE=$(diskutil info "$CONT" | awk -F: '/APFS Physical Store/{gsub(/ /,"",$2); print $2}')
+            SYS=/dev/$(printf '%s' "${STORE:-$CONT}" | sed 's/s[0-9]*$//')
+          fi
           echo "system disk: $SYS"
+          if /bin/bash ./tomos-installer-tui --burn "$SYS" --iso /tmp/test.iso --yes 2>&1 | tee /tmp/refuse.log; then :; fi
+          grep -Eq 'refusing|protected' /tmp/refuse.log || { echo "did not refuse for the right reason"; exit 1; }
           if /bin/bash ./tomos-installer-tui --burn "$SYS" --iso /tmp/test.iso --yes; then echo "should have refused"; exit 1; fi
 
   windows:
