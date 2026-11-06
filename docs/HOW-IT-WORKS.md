@@ -12,7 +12,7 @@
 
 ## Finding the release
 
-The app reads the latest release of `Spruhantom/tom-os-hyperland1` from the GitHub API (falling back to the tags list), then fetches `download/tomos-VERSION-amd64.iso.sha256` and `download/parts.sha256`. The ISO is stored as parts because of GitHub's file-size limit; they're downloaded from `media.githubusercontent.com`.
+The app reads the latest release of `Spruhantom/tom-os-hyperland1` from the GitHub API (falling back to the built-in version, 26.10, if the API can't be reached), then fetches `download/tomos-VERSION-amd64.iso.sha256` and `download/parts.sha256`. The ISO is stored as parts because of GitHub's file-size limit; they're downloaded from `media.githubusercontent.com`.
 
 ## Downloading
 
@@ -24,7 +24,7 @@ The app reads the latest release of `Spruhantom/tom-os-hyperland1` from the GitH
 
 | | Source | Removable means | System disk means |
 |---|---|---|---|
-| Linux | `lsblk -J -b` | `RM=1`, or `TRAN=usb` | has `/`, `/boot`, `/boot/efi` or `[SWAP]` mounted |
+| Linux | `lsblk -dnbP` | `RM=1`, `HOTPLUG=1`, `TRAN=usb`/`mmc`, or an `mmcblk` SD card | has `/`, `/boot`, `/boot/efi`, `/home`, `[SWAP]` or the live system mounted |
 | macOS | `diskutil list -plist physical` + `diskutil info` | removable media, or USB / SD protocol | contains the boot volume, or is its APFS physical store |
 | Windows | `Get-Disk` | `BusType` USB, SD or MMC | `IsBoot` or `IsSystem`, or holds `C:` |
 
@@ -32,8 +32,8 @@ Only removable disks can be selected. `TOMOS_TUI_ALLOW_DEVICE` can add one by na
 
 ## Burning
 
-**Linux**: unmounts every partition (`udisksctl` / `umount`), then
-`dd if=ISO of=/dev/sdX bs=4M oflag=direct conv=sync,fsync status=progress`, then `sync` and `blockdev --rereadpt`.
+**Linux**: unmounts every partition with `umount`, then
+`dd if=ISO of=/dev/sdX bs=4M oflag=direct conv=sync,fsync`, then `sync`, `blockdev --flushbufs` and `partprobe` so the new partitions show up.
 
 **macOS**: `diskutil unmountDisk force /dev/diskN`, then `dd` to the raw `/dev/rdiskN` (much faster), then `diskutil eject`.
 

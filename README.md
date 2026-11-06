@@ -44,7 +44,7 @@ The installer also adds a **Tom OS Installer** entry to your app menu (Linux) or
 - **Reads the stick back** and compares it byte for byte with the image.
 - **Type-to-confirm**: you type the drive name (`sdb`, `disk4`, `disk2`) before anything is erased.
 - **Also a CLI** for scripts: `--list`, `--info`, `--download`, `--burn`.
-- Works in a plain 80x24 terminal and resizes with the window. Supports `NO_COLOR`.
+- Redraws when you resize the terminal window.
 
 ## Screenshots
 
@@ -97,7 +97,7 @@ Environment variables:
 | `TOMOS_TUI_DIR` | Where downloads are kept |
 | `TOMOS_TUI_ALLOW_DEVICE` | Extra device(s) to allow, e.g. an internal SD card reader that isn't reported as removable (`/dev/mmcblk0`, `/dev/disk5`, or a Windows disk number) |
 | `TOMOS_TUI_VERSION` | Pick a specific release instead of the latest |
-| `NO_COLOR` | Turn off colours |
+| `NO_COLOR` | Turn off colours (Linux/macOS) |
 
 ## Safety
 
@@ -130,7 +130,7 @@ Every push runs [GitHub Actions](.github/workflows/test.yml) on real **Ubuntu, m
 
 - **WSL** can't see USB sticks. Use the Windows one-liner in PowerShell instead.
 - **Windows says "You need to format the disk"** after burning: click **Cancel**. Windows can't read the Linux partitions on the stick; that's normal.
-- **The stick doesn't show up**: press `r` to refresh, try another port, or press `a` to see all disks. Card readers inside laptops may need `TOMOS_TUI_ALLOW_DEVICE`.
+- **The stick doesn't show up**: press `r` to refresh, try another port, or press `a` to see all disks. SD card readers are detected automatically; other unusual readers may need `TOMOS_TUI_ALLOW_DEVICE`.
 - **The PC won't boot from it**: pick the stick from the boot menu, choose the UEFI entry, and turn off Secure Boot if it refuses.
 - **Download keeps failing**: just run it again; it resumes where it stopped.
 - **Script blocked on Windows**: the installer uses a `.cmd` shim with `-ExecutionPolicy Bypass`, so no policy changes are needed.
