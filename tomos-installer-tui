@@ -947,7 +947,7 @@ cli_download() {
 cli_burn() {
   local dev="$1" iso="$2" yes="$3" line
   [ -n "$dev" ] || die "--burn needs a device (see --list)"
-  line=$(list_drives | awk -F'|' -v d="$dev" '$1==d')
+  line=$(SHOW_ALL=1 list_drives | awk -F'|' -v d="$dev" '$1==d')
   [ -n "$line" ] || die "no drive called $dev (see --list --all)"
   IFS='|' read -r DRIVE DRIVE_SIZE DRIVE_NAME DRIVE_REMOVABLE sys ro _ <<EOF
 $line
